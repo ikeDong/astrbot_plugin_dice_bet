@@ -1,5 +1,4 @@
 import asyncio
-import random
 import re
 import time
 from dataclasses import dataclass
@@ -24,8 +23,31 @@ class DiceBetPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.recent_dice: dict[str, DiceRecord] = {}
+        self.recent_dice: dict[str, dict[str, DiceRecord]] = {}
         self.self_dice: dict[str, DiceRecord] = {}
+        self.session_locks: dict[str, asyncio.Lock] = {}
+        self.default_max_age_seconds = 300
+
+    def _get_lock(self, session_key: str) -> asyncio.Lock:
+        lock = self.session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_key] = lock
+        return lock
+
+    def _cleanup_expired(self, session_key: str, max_age_seconds: int | None = None) -> None:
+        max_age = int(max_age_seconds or self.default_max_age_seconds)
+        now = time.time()
+        users = self.recent_dice.get(session_key)
+        if users:
+            for uid in list(users.keys()):
+                if now - users[uid].timestamp > max_age:
+                    users.pop(uid, None)
+            if not users:
+                self.recent_dice.pop(session_key, None)
+        rec = self.self_dice.get(session_key)
+        if rec and now - rec.timestamp > max_age:
+            self.self_dice.pop(session_key, None)
 
     def _session_key(self, event: AiocqhttpMessageEvent) -> str:
         gid = event.get_group_id()
@@ -138,14 +160,19 @@ class DiceBetPlugin(Star):
         opponent_user_id: str | None,
         max_age_seconds: int,
     ) -> DiceRecord | None:
-        rec = self.recent_dice.get(session_key)
-        if not rec:
+        self._cleanup_expired(session_key, max_age_seconds)
+        users = self.recent_dice.get(session_key) or {}
+        if opponent_user_id:
+            rec = users.get(str(opponent_user_id))
+            if not rec:
+                return None
+            if time.time() - rec.timestamp > max_age_seconds:
+                return None
+            return rec
+        records = [r for r in users.values() if time.time() - r.timestamp <= max_age_seconds]
+        if not records:
             return None
-        if time.time() - rec.timestamp > max_age_seconds:
-            return None
-        if opponent_user_id and rec.user_id != str(opponent_user_id):
-            return None
-        return rec
+        return max(records, key=lambda r: r.timestamp)
 
     @filter.llm_tool()
     async def roll_qq_dice_for_bet(
@@ -176,36 +203,31 @@ class DiceBetPlugin(Star):
         if not opponent and not allow_without_opponent_dice:
             return "还没发现对方近期发出的骰子。请先让对方发送 QQ 自带骰子，Bot 再后手丢。"
 
-        try:
-            msg_id = await self._send_dice(event)
-        except Exception as e:
-            return f"发送 QQ 骰子失败：{e}"
+        async with self._get_lock(session_key):
+            try:
+                msg_id = await self._send_dice(event)
+            except Exception as e:
+                return f"发送 QQ 骰子失败：{e}"
 
-        bot_value = await self._fetch_message_dice_value(event, msg_id)
-        if bot_value is None:
-            # 兜底：NapCat 理论上可用 get_msg 拿结果；拿不到时避免谎称确定值。
-            bot_value = random.randint(1, 6)
-            uncertain = True
-        else:
-            uncertain = False
+            bot_value = await self._fetch_message_dice_value(event, msg_id)
+            if bot_value is None:
+                return "Bot 已发送 QQ 骰子，但未能从平台回执确认真实点数。为避免误判，本局不计算输赢。"
 
-        self_id = str(event.get_self_id())
-        self_rec = DiceRecord(self_id, bot_value, msg_id, time.time(), True)
-        self.self_dice[session_key] = self_rec
+            self_id = str(event.get_self_id())
+            self_rec = DiceRecord(self_id, bot_value, msg_id, time.time(), True)
+            self.self_dice[session_key] = self_rec
 
-        if not opponent:
-            suffix = "，但未能从回执确认真实点数，返回的是兜底随机值" if uncertain else ""
-            return f"Bot 已发送 QQ 骰子，Bot 点数：{bot_value}{suffix}。没有对手骰子，无法判断输赢。"
+            if not opponent:
+                return f"Bot 已发送 QQ 骰子，Bot 点数：{bot_value}。没有对手骰子，无法判断输赢。"
 
-        if bot_value > opponent.value:
-            result = "Bot 赢了"
-        elif bot_value < opponent.value:
-            result = "Bot 输了"
-        else:
-            result = "平局"
+            if bot_value > opponent.value:
+                result = "Bot 赢了"
+            elif bot_value < opponent.value:
+                result = "Bot 输了"
+            else:
+                result = "平局"
 
-        suffix = "。注意：未能从回执确认 Bot 真实点数，Bot 点数为兜底随机值" if uncertain else ""
-        return f"对手 {opponent.user_id} 点数：{opponent.value}；Bot 点数：{bot_value}；结果：{result}{suffix}。"
+            return f"对手 {opponent.user_id} 点数：{opponent.value}；Bot 点数：{bot_value}；结果：{result}。"
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -225,7 +247,8 @@ class DiceBetPlugin(Star):
             timestamp=time.time(),
             is_self=user_id == self_id,
         )
+        self._cleanup_expired(session_key)
         if rec.is_self:
             self.self_dice[session_key] = rec
         else:
-            self.recent_dice[session_key] = rec
+            self.recent_dice.setdefault(session_key, {})[user_id] = rec
