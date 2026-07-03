@@ -1,0 +1,10 @@
+name: astrbot_plugin_dice_bet
+display_name: QQ骰子赌局
+desc: 让 LLM 在打赌场景中发送 QQ 自带骰子，并从回执/消息中识别骰子结果与输赢
+help: LLM 工具：roll_qq_dice_for_bet。用户先丢骰子后，Bot 可调用工具后丢骰子。
+version: v1.0.0
+author: astrbot
+repo: ""
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.13.0"
