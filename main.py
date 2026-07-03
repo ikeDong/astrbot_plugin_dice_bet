@@ -241,51 +241,69 @@ class DiceBetPlugin(Star):
             return "Bot 赢了"
         return "Bot 输了"
 
-    @filter.llm_tool()
-    async def roll_qq_dice_for_bet(
+    async def _send_and_record_self_game(
         self,
         event: AiocqhttpMessageEvent,
+        session_key: str,
+        seg_name: str,
+    ) -> tuple[int | None, str | None, str | None]:
+        try:
+            msg_id = await self._send_game_magic(event, seg_name)
+        except Exception as e:
+            return None, None, str(e)
+
+        bot_value = await self._fetch_message_game_value(event, msg_id, seg_name)
+        if bot_value is None:
+            return None, msg_id, None
+
+        self_id = str(event.get_self_id())
+        self_rec = GameRecord(self_id, bot_value, msg_id, time.time(), True)
+        if seg_name == "dice":
+            self.self_dice[session_key] = self_rec
+        else:
+            self.self_rps[session_key] = self_rec
+        return bot_value, msg_id, None
+
+    @filter.llm_tool()
+    async def roll_qq_dice(
+        self,
+        event: AiocqhttpMessageEvent,
+        judge_with_opponent: bool = False,
         opponent_user_id: str | None = None,
         max_age_seconds: int = 300,
-        allow_without_opponent_dice: bool = False,
     ) -> str:
         """
-        在 QQ 打赌场景中替 Bot 丢一颗 QQ 自带骰子，并把骰子点数与输赢返回给 LLM。
+        替 Bot 发送一颗 QQ 自带骰子，并返回 Bot 自己的真实点数；需要对局时可同时判定输赢。
 
         使用时机：
-        - 当用户明确想和 Bot 掷骰子打赌、比大小、定输赢时使用。
-        - 一般应该先让对方发送 QQ 自带骰子，确认对方已经丢出结果后，再调用本工具。
-        - 如果还没有检测到对方近期骰子，通常不要调用；应先让对方丢骰子。
+        - 用户只是让 Bot 丢骰子、摇骰子、发一个 QQ 骰子时，直接调用本工具，judge_with_opponent 保持 false。
+        - 用户明确想打赌、比大小、定输赢时，先让对方发送 QQ 自带骰子；检测到对方结果后调用本工具，并设置 judge_with_opponent=true。
+        - 如果 judge_with_opponent=true 但没有检测到对方近期骰子，工具不会发送骰子，会提示先让对方发送。
 
         Args:
+            judge_with_opponent(boolean): 是否按最近的对手骰子判定输赢，默认 false。
             opponent_user_id(string): 对手 QQ 号。可为空，为空时使用当前会话最近一个非 Bot 骰子。
             max_age_seconds(number): 接受对手骰子的最大时间窗口，默认 300 秒。
-            allow_without_opponent_dice(boolean): 是否允许没有对手骰子也直接丢。默认 false。
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return "失败：当前平台不是 aiocqhttp / NapCat，不能发送 QQ 自带骰子。"
 
         session_key = self._session_key(event)
-        opponent = self._find_recent_opponent_dice(session_key, opponent_user_id, int(max_age_seconds or 300))
-        if not opponent and not allow_without_opponent_dice:
-            return "还没发现对方近期发出的骰子。请先让对方发送 QQ 自带骰子，Bot 再后手丢。"
+        opponent = None
+        if judge_with_opponent:
+            opponent = self._find_recent_opponent_dice(session_key, opponent_user_id, int(max_age_seconds or 300))
+            if not opponent:
+                return "还没发现对方近期发出的骰子。请先让对方发送 QQ 自带骰子，Bot 再后手丢。"
 
         async with self._get_lock(session_key):
-            try:
-                msg_id = await self._send_game_magic(event, "dice")
-            except Exception as e:
-                return f"发送 QQ 骰子失败：{e}"
-
-            bot_value = await self._fetch_message_game_value(event, msg_id, "dice")
+            bot_value, _, error = await self._send_and_record_self_game(event, session_key, "dice")
+            if error:
+                return f"发送 QQ 骰子失败：{error}"
             if bot_value is None:
-                return "Bot 已发送 QQ 骰子，但未能从平台回执确认真实点数。为避免误判，本局不计算输赢。"
+                return "Bot 已发送 QQ 骰子，但未能从平台回执确认真实点数。"
 
-            self_id = str(event.get_self_id())
-            self_rec = GameRecord(self_id, bot_value, msg_id, time.time(), True)
-            self.self_dice[session_key] = self_rec
-
-            if not opponent:
-                return f"Bot 已发送 QQ 骰子，Bot 点数：{bot_value}。没有对手骰子，无法判断输赢。"
+            if not judge_with_opponent:
+                return f"Bot 已发送 QQ 骰子，点数：{bot_value}。"
 
             if bot_value > opponent.value:
                 result = "Bot 赢了"
@@ -297,51 +315,46 @@ class DiceBetPlugin(Star):
             return f"对手 {opponent.user_id} 点数：{opponent.value}；Bot 点数：{bot_value}；结果：{result}。"
 
     @filter.llm_tool()
-    async def play_qq_rps_for_bet(
+    async def play_qq_rps(
         self,
         event: AiocqhttpMessageEvent,
+        judge_with_opponent: bool = False,
         opponent_user_id: str | None = None,
         max_age_seconds: int = 300,
-        allow_without_opponent_rps: bool = False,
     ) -> str:
         """
-        在 QQ 打赌场景中替 Bot 发一个 QQ 自带猜拳魔法表情，并把石头剪刀布结果与输赢返回给 LLM。
+        替 Bot 发送一个 QQ 自带猜拳魔法表情，并返回 Bot 自己的真实结果；需要对局时可同时判定输赢。
 
         使用时机：
-        - 当用户明确想和 Bot 猜拳、石头剪刀布、用 QQ 猜拳魔法表情定输赢时使用。
-        - 一般应该先让对方发送 QQ 自带猜拳，确认对方已经发出结果后，再调用本工具。
-        - 如果还没有检测到对方近期猜拳，通常不要调用；应先让对方发猜拳。
+        - 用户只是让 Bot 发石头剪刀布、猜拳、QQ 猜拳时，直接调用本工具，judge_with_opponent 保持 false。
+        - 用户明确想猜拳对局、打赌、定输赢时，先让对方发送 QQ 自带猜拳；检测到对方结果后调用本工具，并设置 judge_with_opponent=true。
+        - 如果 judge_with_opponent=true 但没有检测到对方近期猜拳，工具不会发送猜拳，会提示先让对方发送。
 
         Args:
+            judge_with_opponent(boolean): 是否按最近的对手猜拳判定输赢，默认 false。
             opponent_user_id(string): 对手 QQ 号。可为空，为空时使用当前会话最近一个非 Bot 猜拳。
             max_age_seconds(number): 接受对手猜拳的最大时间窗口，默认 300 秒。
-            allow_without_opponent_rps(boolean): 是否允许没有对手猜拳也直接发。默认 false。
         """
         if not isinstance(event, AiocqhttpMessageEvent):
             return "失败：当前平台不是 aiocqhttp / NapCat，不能发送 QQ 自带猜拳。"
 
         session_key = self._session_key(event)
-        opponent = self._find_recent_opponent_rps(session_key, opponent_user_id, int(max_age_seconds or 300))
-        if not opponent and not allow_without_opponent_rps:
-            return "还没发现对方近期发出的猜拳。请先让对方发送 QQ 自带猜拳，Bot 再后手发。"
+        opponent = None
+        if judge_with_opponent:
+            opponent = self._find_recent_opponent_rps(session_key, opponent_user_id, int(max_age_seconds or 300))
+            if not opponent:
+                return "还没发现对方近期发出的猜拳。请先让对方发送 QQ 自带猜拳，Bot 再后手发。"
 
         async with self._get_lock(session_key):
-            try:
-                msg_id = await self._send_game_magic(event, "rps")
-            except Exception as e:
-                return f"发送 QQ 猜拳失败：{e}"
-
-            bot_value = await self._fetch_message_game_value(event, msg_id, "rps")
+            bot_value, _, error = await self._send_and_record_self_game(event, session_key, "rps")
+            if error:
+                return f"发送 QQ 猜拳失败：{error}"
             if bot_value is None:
-                return "Bot 已发送 QQ 猜拳，但未能从平台回执确认真实结果。为避免误判，本局不计算输赢。"
-
-            self_id = str(event.get_self_id())
-            self_rec = GameRecord(self_id, bot_value, msg_id, time.time(), True)
-            self.self_rps[session_key] = self_rec
+                return "Bot 已发送 QQ 猜拳，但未能从平台回执确认真实结果。"
 
             bot_name = self.RPS_NAMES.get(bot_value, str(bot_value))
-            if not opponent:
-                return f"Bot 已发送 QQ 猜拳，Bot 结果：{bot_name}。没有对手猜拳，无法判断输赢。"
+            if not judge_with_opponent:
+                return f"Bot 已发送 QQ 猜拳，结果：{bot_name}。"
 
             opponent_name = self.RPS_NAMES.get(opponent.value, str(opponent.value))
             result = self._judge_rps(bot_value, opponent.value)

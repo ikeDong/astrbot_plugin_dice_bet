@@ -1,8 +1,8 @@
 name: astrbot_plugin_dice_bet
 display_name: QQ骰子猜拳赌局
-desc: 让 LLM 在打赌场景中发送 QQ 自带骰子或猜拳，并从回执/消息中识别真实结果与输赢
-help: LLM 工具：roll_qq_dice_for_bet、play_qq_rps_for_bet。用户先发对应 QQ 魔法表情后，Bot 可后手发送并判定输赢。
-version: v1.2.0
+desc: 让 LLM 发送 QQ 自带骰子 / 猜拳，并按需识别真实结果与输赢
+help: LLM 工具：roll_qq_dice、play_qq_rps。单发时直接调用；对局时先让用户发送，再设置 judge_with_opponent=true 判定输赢。
+version: v1.3.0
 author: astrbot
 repo: "https://github.com/ikeDong/astrbot_plugin_dice_bet"
 support_platforms:
