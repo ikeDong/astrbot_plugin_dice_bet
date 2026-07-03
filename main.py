@@ -10,7 +10,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import Aioc
 
 
 @dataclass
-class DiceRecord:
+class GameRecord:
     user_id: str
     value: int
     message_id: str | None
@@ -19,12 +19,20 @@ class DiceRecord:
 
 
 class DiceBetPlugin(Star):
-    """QQ 自带骰子赌局工具。"""
+    """QQ 自带骰子 / 猜拳赌局工具。"""
+
+    RPS_NAMES = {
+        1: "石头",
+        2: "剪刀",
+        3: "布",
+    }
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.recent_dice: dict[str, dict[str, DiceRecord]] = {}
-        self.self_dice: dict[str, DiceRecord] = {}
+        self.recent_dice: dict[str, dict[str, GameRecord]] = {}
+        self.self_dice: dict[str, GameRecord] = {}
+        self.recent_rps: dict[str, dict[str, GameRecord]] = {}
+        self.self_rps: dict[str, GameRecord] = {}
         self.session_locks: dict[str, asyncio.Lock] = {}
         self.default_max_age_seconds = 300
 
@@ -48,6 +56,16 @@ class DiceBetPlugin(Star):
         rec = self.self_dice.get(session_key)
         if rec and now - rec.timestamp > max_age:
             self.self_dice.pop(session_key, None)
+        users = self.recent_rps.get(session_key)
+        if users:
+            for uid in list(users.keys()):
+                if now - users[uid].timestamp > max_age:
+                    users.pop(uid, None)
+            if not users:
+                self.recent_rps.pop(session_key, None)
+        rec = self.self_rps.get(session_key)
+        if rec and now - rec.timestamp > max_age:
+            self.self_rps.pop(session_key, None)
 
     def _session_key(self, event: AiocqhttpMessageEvent) -> str:
         gid = event.get_group_id()
@@ -74,24 +92,29 @@ class DiceBetPlugin(Star):
                 return []
         return []
 
-    def _extract_dice_value_from_segments(self, segments: list[dict]) -> int | None:
+    def _extract_game_value_from_segments(self, segments: list[dict], seg_name: str, min_value: int, max_value: int) -> int | None:
         for seg in segments:
             seg_type = str(seg.get("type", "")).lower()
             data = seg.get("data") or {}
-            if seg_type == "dice":
-                for key in ("result", "value", "id"):
-                    val = data.get(key)
-                    if val is not None:
-                        try:
-                            num = int(val)
-                            if 1 <= num <= 6:
-                                return num
-                        except Exception:
-                            pass
-                return None
-            if seg_type == "rps":
+            if seg_type != seg_name:
                 continue
+            for key in ("result", "value", "id"):
+                val = data.get(key)
+                if val is not None:
+                    try:
+                        num = int(val)
+                        if min_value <= num <= max_value:
+                            return num
+                    except Exception:
+                        pass
+            return None
         return None
+
+    def _extract_dice_value_from_segments(self, segments: list[dict]) -> int | None:
+        return self._extract_game_value_from_segments(segments, "dice", 1, 6)
+
+    def _extract_rps_value_from_segments(self, segments: list[dict]) -> int | None:
+        return self._extract_game_value_from_segments(segments, "rps", 1, 3)
 
     def _extract_dice_value_from_text(self, text: str | None) -> int | None:
         if not text:
@@ -110,6 +133,22 @@ class DiceBetPlugin(Star):
             return value
         return self._extract_dice_value_from_text(fallback_text)
 
+    def _extract_rps_value_from_text(self, text: str | None) -> int | None:
+        if not text:
+            return None
+        m = re.search(r"\[CQ:rps(?:,[^\]]*)?(?:result|value|id)=([1-3])[^\]]*\]", text)
+        if m:
+            return int(m.group(1))
+        if "[CQ:rps" in text or "type=rps" in text:
+            return None
+        return None
+
+    def _extract_rps_value(self, raw: Any, fallback_text: str | None = None) -> int | None:
+        value = self._extract_rps_value_from_segments(self._extract_segments(raw))
+        if value is not None:
+            return value
+        return self._extract_rps_value_from_text(fallback_text)
+
     def _get_message_id_from_raw(self, raw: Any) -> str | None:
         if raw is None:
             return None
@@ -119,10 +158,10 @@ class DiceBetPlugin(Star):
         except Exception:
             return None
 
-    async def _send_dice(self, event: AiocqhttpMessageEvent) -> str | None:
+    async def _send_game_magic(self, event: AiocqhttpMessageEvent, seg_name: str) -> str | None:
         is_group = bool(event.get_group_id())
         session_id = event.get_group_id() if is_group else event.get_sender_id()
-        payload = [{"type": "dice", "data": {}}]
+        payload = [{"type": seg_name, "data": {}}]
         routing_params = {}
         raw_event = getattr(event.message_obj, "raw_message", None)
         try:
@@ -140,13 +179,14 @@ class DiceBetPlugin(Star):
             return str(ret.get("message_id"))
         return None
 
-    async def _fetch_message_dice_value(self, event: AiocqhttpMessageEvent, message_id: str | None) -> int | None:
+    async def _fetch_message_game_value(self, event: AiocqhttpMessageEvent, message_id: str | None, seg_name: str) -> int | None:
         if not message_id:
             return None
+        extractor = self._extract_dice_value if seg_name == "dice" else self._extract_rps_value
         for _ in range(6):
             try:
                 ret = await event.bot.get_msg(message_id=int(message_id))
-                value = self._extract_dice_value(ret, str(ret))
+                value = extractor(ret, str(ret))
                 if value is not None:
                     return value
             except Exception:
@@ -159,7 +199,7 @@ class DiceBetPlugin(Star):
         session_key: str,
         opponent_user_id: str | None,
         max_age_seconds: int,
-    ) -> DiceRecord | None:
+    ) -> GameRecord | None:
         self._cleanup_expired(session_key, max_age_seconds)
         users = self.recent_dice.get(session_key) or {}
         if opponent_user_id:
@@ -173,6 +213,33 @@ class DiceBetPlugin(Star):
         if not records:
             return None
         return max(records, key=lambda r: r.timestamp)
+
+    def _find_recent_opponent_rps(
+        self,
+        session_key: str,
+        opponent_user_id: str | None,
+        max_age_seconds: int,
+    ) -> GameRecord | None:
+        self._cleanup_expired(session_key, max_age_seconds)
+        users = self.recent_rps.get(session_key) or {}
+        if opponent_user_id:
+            rec = users.get(str(opponent_user_id))
+            if not rec:
+                return None
+            if time.time() - rec.timestamp > max_age_seconds:
+                return None
+            return rec
+        records = [r for r in users.values() if time.time() - r.timestamp <= max_age_seconds]
+        if not records:
+            return None
+        return max(records, key=lambda r: r.timestamp)
+
+    def _judge_rps(self, bot_value: int, opponent_value: int) -> str:
+        if bot_value == opponent_value:
+            return "平局"
+        if (bot_value, opponent_value) in ((1, 2), (2, 3), (3, 1)):
+            return "Bot 赢了"
+        return "Bot 输了"
 
     @filter.llm_tool()
     async def roll_qq_dice_for_bet(
@@ -205,16 +272,16 @@ class DiceBetPlugin(Star):
 
         async with self._get_lock(session_key):
             try:
-                msg_id = await self._send_dice(event)
+                msg_id = await self._send_game_magic(event, "dice")
             except Exception as e:
                 return f"发送 QQ 骰子失败：{e}"
 
-            bot_value = await self._fetch_message_dice_value(event, msg_id)
+            bot_value = await self._fetch_message_game_value(event, msg_id, "dice")
             if bot_value is None:
                 return "Bot 已发送 QQ 骰子，但未能从平台回执确认真实点数。为避免误判，本局不计算输赢。"
 
             self_id = str(event.get_self_id())
-            self_rec = DiceRecord(self_id, bot_value, msg_id, time.time(), True)
+            self_rec = GameRecord(self_id, bot_value, msg_id, time.time(), True)
             self.self_dice[session_key] = self_rec
 
             if not opponent:
@@ -229,26 +296,94 @@ class DiceBetPlugin(Star):
 
             return f"对手 {opponent.user_id} 点数：{opponent.value}；Bot 点数：{bot_value}；结果：{result}。"
 
+    @filter.llm_tool()
+    async def play_qq_rps_for_bet(
+        self,
+        event: AiocqhttpMessageEvent,
+        opponent_user_id: str | None = None,
+        max_age_seconds: int = 300,
+        allow_without_opponent_rps: bool = False,
+    ) -> str:
+        """
+        在 QQ 打赌场景中替 Bot 发一个 QQ 自带猜拳魔法表情，并把石头剪刀布结果与输赢返回给 LLM。
+
+        使用时机：
+        - 当用户明确想和 Bot 猜拳、石头剪刀布、用 QQ 猜拳魔法表情定输赢时使用。
+        - 一般应该先让对方发送 QQ 自带猜拳，确认对方已经发出结果后，再调用本工具。
+        - 如果还没有检测到对方近期猜拳，通常不要调用；应先让对方发猜拳。
+
+        Args:
+            opponent_user_id(string): 对手 QQ 号。可为空，为空时使用当前会话最近一个非 Bot 猜拳。
+            max_age_seconds(number): 接受对手猜拳的最大时间窗口，默认 300 秒。
+            allow_without_opponent_rps(boolean): 是否允许没有对手猜拳也直接发。默认 false。
+        """
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return "失败：当前平台不是 aiocqhttp / NapCat，不能发送 QQ 自带猜拳。"
+
+        session_key = self._session_key(event)
+        opponent = self._find_recent_opponent_rps(session_key, opponent_user_id, int(max_age_seconds or 300))
+        if not opponent and not allow_without_opponent_rps:
+            return "还没发现对方近期发出的猜拳。请先让对方发送 QQ 自带猜拳，Bot 再后手发。"
+
+        async with self._get_lock(session_key):
+            try:
+                msg_id = await self._send_game_magic(event, "rps")
+            except Exception as e:
+                return f"发送 QQ 猜拳失败：{e}"
+
+            bot_value = await self._fetch_message_game_value(event, msg_id, "rps")
+            if bot_value is None:
+                return "Bot 已发送 QQ 猜拳，但未能从平台回执确认真实结果。为避免误判，本局不计算输赢。"
+
+            self_id = str(event.get_self_id())
+            self_rec = GameRecord(self_id, bot_value, msg_id, time.time(), True)
+            self.self_rps[session_key] = self_rec
+
+            bot_name = self.RPS_NAMES.get(bot_value, str(bot_value))
+            if not opponent:
+                return f"Bot 已发送 QQ 猜拳，Bot 结果：{bot_name}。没有对手猜拳，无法判断输赢。"
+
+            opponent_name = self.RPS_NAMES.get(opponent.value, str(opponent.value))
+            result = self._judge_rps(bot_value, opponent.value)
+            return f"对手 {opponent.user_id} 结果：{opponent_name}；Bot 结果：{bot_name}；结果：{result}。"
+
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AiocqhttpMessageEvent):
         raw = getattr(event.message_obj, "raw_message", None)
-        value = self._extract_dice_value(raw, event.message_str)
-        if value is None:
+        dice_value = self._extract_dice_value(raw, event.message_str)
+        rps_value = self._extract_rps_value(raw, event.message_str)
+        if dice_value is None and rps_value is None:
             return
 
         session_key = self._session_key(event)
         user_id = str(event.get_sender_id())
         self_id = str(event.get_self_id())
-        rec = DiceRecord(
-            user_id=user_id,
-            value=value,
-            message_id=self._get_message_id_from_raw(raw),
-            timestamp=time.time(),
-            is_self=user_id == self_id,
-        )
+        message_id = self._get_message_id_from_raw(raw)
         self._cleanup_expired(session_key)
-        if rec.is_self:
-            self.self_dice[session_key] = rec
-        else:
-            self.recent_dice.setdefault(session_key, {})[user_id] = rec
+
+        if dice_value is not None:
+            rec = GameRecord(
+                user_id=user_id,
+                value=dice_value,
+                message_id=message_id,
+                timestamp=time.time(),
+                is_self=user_id == self_id,
+            )
+            if rec.is_self:
+                self.self_dice[session_key] = rec
+            else:
+                self.recent_dice.setdefault(session_key, {})[user_id] = rec
+
+        if rps_value is not None:
+            rec = GameRecord(
+                user_id=user_id,
+                value=rps_value,
+                message_id=message_id,
+                timestamp=time.time(),
+                is_self=user_id == self_id,
+            )
+            if rec.is_self:
+                self.self_rps[session_key] = rec
+            else:
+                self.recent_rps.setdefault(session_key, {})[user_id] = rec
